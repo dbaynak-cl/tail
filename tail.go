@@ -45,8 +45,8 @@ type Line struct {
 // release.
 //
 // NewLine returns a * pointer to a Line struct.
-func NewLine(text string, lineNum int) *Line {
-	return &Line{text, lineNum, SeekInfo{}, time.Now(), nil}
+func NewLine(text string, lineNum int) Line {
+	return Line{text, lineNum, SeekInfo{}, time.Now(), nil}
 }
 
 // SeekInfo represents arguments to io.Seek. See: https://golang.org/pkg/io/#SectionReader.Seek
@@ -81,6 +81,9 @@ type Config struct {
 	MaxLineSize   int  // If non-zero, split longer lines into multiple lines
 	CompleteLines bool // Only return complete lines (that end with "\n" or EOF when Follow is false)
 
+	ChannelSize                   int
+	LineNumberShouldNotBeIncluded bool
+
 	// Optionally, use a ratelimiter (e.g. created by the ratelimiter/NewLeakyBucket function)
 	RateLimiter *ratelimiter.LeakyBucket
 
@@ -90,9 +93,9 @@ type Config struct {
 }
 
 type Tail struct {
-	Filename string     // The filename
-	Lines    chan *Line // A consumable channel of *Line
-	Config              // Tail.Configuration
+	Filename string    // The filename
+	Lines    chan Line // A consumable channel of *Line
+	Config             // Tail.Configuration
 
 	file    *os.File
 	reader  *bufio.Reader
@@ -125,9 +128,15 @@ func TailFile(filename string, config Config) (*Tail, error) {
 		util.Fatal("cannot set ReOpen without Follow.")
 	}
 
+	var lines chan Line
+	if config.ChannelSize == 0 {
+		lines = make(chan Line)
+	} else {
+		lines = make(chan Line, config.ChannelSize)
+	}
 	t := &Tail{
 		Filename: filename,
-		Lines:    make(chan *Line),
+		Lines:    lines,
 		Config:   config,
 	}
 
@@ -235,13 +244,27 @@ func (tail *Tail) reopen() error {
 	return nil
 }
 
+func trimRightNewline(s string) string {
+	if len(s) == 0 {
+		return s
+	}
+	i := len(s) - 1
+	for i >= 0 && s[i] == '\n' {
+		i--
+	}
+	if i < 0 {
+		return ""
+	}
+	return s[:i+1]
+}
+
 func (tail *Tail) readLine() (string, error) {
 	tail.lk.Lock()
 	line, err := tail.reader.ReadString('\n')
 	tail.lk.Unlock()
 
 	newlineEnding := strings.HasSuffix(line, "\n")
-	line = strings.TrimRight(line, "\n")
+	line = trimRightNewline(line)
 
 	// if we don't have to handle incomplete lines, we can return the line as-is
 	if !tail.Config.CompleteLines {
@@ -295,15 +318,6 @@ func (tail *Tail) tailFileSync() {
 
 	// Read line by line.
 	for {
-		// do not seek in named pipes
-		if !tail.Pipe {
-			// grab the position in case we need to back up in the event of a half-line
-			if _, err := tail.Tell(); err != nil {
-				tail.Kill(err)
-				return
-			}
-		}
-
 		line, err := tail.readLine()
 
 		// Process `line` even if err is EOF.
@@ -313,8 +327,12 @@ func (tail *Tail) tailFileSync() {
 				// Wait a second before seeking till the end of
 				// file when rate limit is reached.
 				msg := ("Too much log activity; waiting a second before resuming tailing")
-				offset, _ := tail.Tell()
-				tail.Lines <- &Line{msg, tail.lineNum, SeekInfo{Offset: offset}, time.Now(), errors.New(msg)}
+
+				l := Line{msg, tail.lineNum, SeekInfo{}, time.Now(), errors.New(msg)}
+				if !tail.Config.LineNumberShouldNotBeIncluded {
+					l.SeekInfo.Offset, _ = tail.Tell()
+				}
+				tail.Lines <- l
 				select {
 				case <-time.After(time.Second):
 				case <-tail.Dying():
@@ -452,9 +470,12 @@ func (tail *Tail) sendLine(line string) bool {
 
 	for _, line := range lines {
 		tail.lineNum++
-		offset, _ := tail.Tell()
+		l := Line{line, tail.lineNum, SeekInfo{}, now, nil}
+		if !tail.Config.LineNumberShouldNotBeIncluded {
+			l.SeekInfo.Offset, _ = tail.Tell()
+		}
 		select {
-		case tail.Lines <- &Line{line, tail.lineNum, SeekInfo{Offset: offset}, now, nil}:
+		case tail.Lines <- l:
 		case <-tail.Dying():
 			return true
 		}
